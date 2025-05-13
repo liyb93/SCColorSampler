@@ -47,13 +47,13 @@ public class SCColorSampler: NSObject {
         hoverHandler: ((_ hoveredColor: NSColor) -> Void)? = nil,
         selectionHandler: @escaping (_ selectedColor: NSColor?) -> Void
     ) {
-        let hasScreenCaptureAccess = CGPreflightScreenCaptureAccess()
-        if hasScreenCaptureAccess {
-            ColorSampler.shared.sample(
-                onMouseMoved: hoverHandler ?? { _ in },
-                selectionHandler: selectionHandler,
-                configuration: configuration
-            )
-        }
+//        let hasScreenCaptureAccess = CGPreflightScreenCaptureAccess()
+//        if hasScreenCaptureAccess {
+        ColorSampler.shared.sample(
+            onMouseMoved: hoverHandler ?? { _ in },
+            selectionHandler: selectionHandler,
+            configuration: configuration
+        )
+//        }
     }
 }
