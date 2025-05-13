@@ -62,10 +62,11 @@ internal class ColorSamplerWindow: NSWindow {
         // NSWindow properties
         self.delegate = delegate
         self.isOpaque = false
-        self.backgroundColor = .clear
+        self.backgroundColor = .init(red: 1, green: 1, blue: 1, alpha: 0.001) // 让隐形窗口不可见，但是不能透传点击事件到底部
         self.level = .screenSaver
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         self.ignoresMouseEvents = false
+        self.acceptsMouseMovedEvents = true
         // Start stream
         Task {
             await startStream()
@@ -118,7 +119,7 @@ internal class ColorSamplerWindow: NSWindow {
                 contentRect: .init(
                     origin: .init(
                         x: self.frame.midX - 50,
-                        y: self.frame.minY - 35
+                        y: self.frame.minY - 35 + delegate.config.padding // 实时颜色的位置根据用户可见区域计算
                     ),
                     size: .init(
                         width: 100,
@@ -133,10 +134,66 @@ internal class ColorSamplerWindow: NSWindow {
         }
     }
     
+    /// This function get user view frame from calculated window frame.
+    ///
+    /// Be cautious this function should only be used after window frame is set by `getWindowOriginPoint`
+    private func getUserViewSize() -> CGSize {
+        return unwrappedDelegate.config.loupeSize.getSize()
+    }
+    
+    // Get origin point(zero point) of the rectangle area(loupe)
+    private func getWindowOriginPoint(_ position: NSPoint, _ display: NSScreen) -> NSPoint {
+        let displayOrigin = display.frame.origin
+        // should minus display origin point for multiple displays
+        let position = NSPoint(x: position.x - displayOrigin.x, y: position.y - displayOrigin.y)
+        let config = unwrappedDelegate.config
+        let safeAreaDistance: CGFloat = 10
+        
+        var origin: NSPoint = .zero
+        // 在隐形窗口之内的用户可见区域
+        let size: CGSize = getUserViewSize()
+        // Need dodge when mouse reach edge of screen, especially bottom and right edge
+        switch config.loupeFollowMode {
+        case .center:
+            origin = .init(x: position.x - self.frame.size.width / 2, y: position.y - (self.frame.size.height / 2))
+        case .noBlock:
+            if position.x + size.width >= display.frame.width - safeAreaDistance && position.y - size.height <= safeAreaDistance {
+                // right and bottom
+                origin = .init(
+                    x: position.x - self.frame.size.width + config.padding,
+                    y: position.y - config.padding
+                )
+            } else if position.x + size.width >= display.frame.width - safeAreaDistance { // 使用用户可见区域判断
+                // right
+                origin = .init(
+                    x: position.x - self.frame.size.width + config.padding,
+                    y: position.y - self.frame.size.height + config.padding - config.loupeFollowDistance // 但是使用窗口大小计算，因为计算的不是可见区域的原点，而是外部窗口的原点
+                )
+            } else if position.y - size.height <= safeAreaDistance {
+                // bottom
+                origin = .init(
+                    x: position.x - config.padding,
+                    y: position.y - config.padding
+                )
+            } else {
+                // top and left
+                origin = .init(
+                    x: position.x - config.padding + config.loupeFollowDistance,
+                    y: position.y - self.frame.size.height + config.padding - config.loupeFollowDistance
+                )
+            }
+        }
+        
+        // should add origin back cause we want an absolute value caculated base on (0,0)
+        return .init(
+            x: origin.x + displayOrigin.x,
+            y: origin.y + displayOrigin.y
+        )
+    }
     // Override NSWindow methods
+    // 这个方法需要采样窗口一直是key，但是这样其它窗口就会失去焦点，颜色会变，因此不能再用了
     override open func mouseMoved(with event: NSEvent) {
         let position = NSEvent.mouseLocation
-        
         guard let screenWithMouse = NSScreen.screens.first(
             where: { NSMouseInRect(position, $0.frame, false) }
         )
@@ -147,11 +204,8 @@ internal class ColorSamplerWindow: NSWindow {
         if self.activeDisplay != screenWithMouse {
             self.activeDisplay = screenWithMouse
         }
-                        
-        let origin: NSPoint = .init(
-            x: position.x - (self.frame.size.width / 2),
-            y: position.y - (self.frame.size.height / 2)
-        )
+        
+        let origin: NSPoint = getWindowOriginPoint(position, screenWithMouse)
         self.setFrameOrigin(origin)
         
         if let image = croppedImageBinding.wrappedValue,
@@ -174,7 +228,16 @@ internal class ColorSamplerWindow: NSWindow {
         super.mouseMoved(with: event)
     }
     
-    override open func mouseDown(with event: NSEvent) {
+//    override open func mouseDown(with event: NSEvent) {
+//        if let color = self.croppedImageBinding.wrappedValue?.colorAtCenter(),
+//           let delegate = self.delegate as? ColorSamplerDelegate {
+//            delegate.callSelectionHandler(color: color)
+//        }
+//        self.orderOut(self)
+//    }
+//    
+    func finalizeColor() {
+//        print("finalize color down")
         if let color = self.croppedImageBinding.wrappedValue?.colorAtCenter(),
            let delegate = self.delegate as? ColorSamplerDelegate {
             delegate.callSelectionHandler(color: color)
@@ -212,12 +275,14 @@ internal class ColorSamplerWindow: NSWindow {
             return
         }
         
-        if event.scrollingDeltaY < -1 {
+        let deltaY = delegate.config.zoomWheelInverse ? -event.scrollingDeltaY : event.scrollingDeltaY
+        
+        if deltaY < -1 {
             guard let nextZoom = zoom?.getNextZoom(available: delegate.config.zoomValues) else {
                 return
             }
             zoom = nextZoom
-        } else if event.scrollingDeltaY > 1 {
+        } else if deltaY > 1 {
             guard let previousZoom = zoom?.getPreviousZoom(available: delegate.config.zoomValues) else {
                 return
             }
@@ -228,14 +293,22 @@ internal class ColorSamplerWindow: NSWindow {
         super.scrollWheel(with: event)
     }
     
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == kVK_Escape {
-            if let delegate = self.delegate as? ColorSamplerDelegate {
-                delegate.callSelectionHandler(color: nil)
-            }
-            self.orderOut(self)
+    func cancel() {
+        if let delegate = self.delegate as? ColorSamplerDelegate {
+            delegate.callSelectionHandler(color: nil)
         }
+        self.orderOut(self)
     }
+    
+    // 取消置顶后，这里的keydonw就不能用了
+//    override func keyDown(with event: NSEvent) {
+//        if event.keyCode == kVK_Escape {
+//            if let delegate = self.delegate as? ColorSamplerDelegate {
+//                delegate.callSelectionHandler(color: nil)
+//            }
+//            self.orderOut(self)
+//        }
+//    }
 }
 
 extension ColorSamplerWindow {
@@ -269,8 +342,7 @@ extension ColorSamplerWindow {
                         zoom: zoomBinding,
                         image: croppedImageBinding,
                         loupeColor: loupeColorBinding,
-                        shape: delegate.config.loupeShape,
-                        quality: delegate.config.quality
+                        config: delegate.config
                     )
                     self.contentView = contentView
                     if unwrappedDelegate.config.showColorDescription {
@@ -282,7 +354,7 @@ extension ColorSamplerWindow {
                             NSRect.init(
                                 origin: .init(
                                     x: self.frame.midX - newWidth / 2,
-                                    y: self.frame.minY - 35
+                                    y: self.frame.minY - 35 + delegate.config.padding
                                 ),
                                 size: .init(
                                     width: newWidth,
@@ -386,20 +458,23 @@ internal extension ColorSamplerWindow {
                     
         var captureSize: CGFloat = round(
             round(
-                self.frame.size.width / self.zoom!.getPixelZoom(quality: delegate.config.quality)
+                delegate.config.loupeSize.getSize().width / self.zoom!.getPixelZoom(quality: delegate.config.quality)
             ) * delegate.config.quality.getMultiplier()
         )
         
         if captureSize.truncatingRemainder(dividingBy: 2) != 0 { captureSize += 1 }
+        
+        let loupeSize = delegate.config.loupeSize.getSize()
+        let captureSizeY = captureSize * loupeSize.height / loupeSize.width
         
         let x = (position.x - display.frame.origin.x) * delegate.config.quality.getMultiplier()
         let y = (display.frame.height - (position.y - display.frame.origin.y)) * delegate.config.quality.getMultiplier()
         
         let captureRect = NSRect(
             x: x - (captureSize / 2),
-            y: y - (captureSize / 2),
+            y: y - (captureSizeY / 2),
             width: captureSize,
-            height: captureSize
+            height: captureSizeY
         )
                         
         guard let croppedImage = image.cropping(to: captureRect) else {
